@@ -7,12 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       que:
-        description: 'Qué datos generar'
+        description: 'Qué generar'
         type: choice
         default: todo
         options:
           - todo
           - solo_colectivos
+          - apk
 
 permissions:
   contents: write
@@ -20,7 +21,7 @@ permissions:
 jobs:
   apk:
     name: Compilar APK
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.que == 'apk'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +55,7 @@ jobs:
 
   datos:
     name: Generar mapa, rutas y colectivos
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.que != 'apk'
     runs-on: ubuntu-latest
     timeout-minutes: 170
     steps:
