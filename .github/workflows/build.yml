@@ -1,0 +1,153 @@
+name: Mapa BA
+
+on:
+  push:
+    paths:
+      - 'mapa-ba*.zip'
+  workflow_dispatch:
+    inputs:
+      que:
+        description: 'Qué datos generar'
+        type: choice
+        default: todo
+        options:
+          - todo
+          - solo_colectivos
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: Compilar APK
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Elegir el zip más nuevo y descomprimir
+        run: |
+          ZIP=$(for f in mapa-ba*.zip; do echo "$(git log -1 --format=%ct -- "$f") $f"; done | sort -n | tail -1 | cut -d' ' -f2-)
+          echo "Usando: $ZIP"
+          rm -rf proyecto
+          unzip -q -o "$ZIP" -d proyecto
+
+      - name: Compilar
+        working-directory: proyecto
+        run: gradle assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MapaBA-APK
+          path: proyecto/app/build/outputs/apk/release/*.apk
+
+  datos:
+    name: Generar mapa, rutas y colectivos
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descomprimir el proyecto (para usar los scripts)
+        run: |
+          ZIP=$(for f in mapa-ba*.zip; do echo "$(git log -1 --format=%ct -- "$f") $f"; done | sort -n | tail -1 | cut -d' ' -f2-)
+          echo "Usando: $ZIP"
+          unzip -q -o "$ZIP" -d proyecto
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Instalar herramientas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool
+
+      - name: Bajar Argentina de OpenStreetMap
+        run: |
+          wget -q -O argentina.osm.pbf https://download.geofabrik.de/south-america/argentina-latest.osm.pbf
+          ls -lh argentina.osm.pbf
+
+      - name: Recortar CABA y Gran Buenos Aires
+        run: |
+          osmium extract --bbox=-58.95,-35.10,-57.80,-34.20 argentina.osm.pbf -o ba.osm.pbf --overwrite
+          ls -lh ba.osm.pbf
+
+      - name: Líneas de colectivo
+        run: |
+          osmium tags-filter ba.osm.pbf r/route=bus r/route=trolleybus -o colectivos.osm.pbf --overwrite
+          osmium cat colectivos.osm.pbf -o colectivos.osm --overwrite
+          ls -lh colectivos.osm
+          python3 proyecto/tools/build_bus.py colectivos.osm buenos-aires.bus
+          ls -lh buenos-aires.bus
+          test "$(stat -c%s buenos-aires.bus)" -gt 100000
+
+      - name: Publicar colectivos
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mapas
+          name: Mapas sin conexión
+          body: Datos de Buenos Aires generados a partir de OpenStreetMap (© colaboradores de OpenStreetMap, licencia ODbL).
+          files: buenos-aires.bus
+
+      - name: Bajar Osmosis y el plugin de Mapsforge
+        if: inputs.que == 'todo'
+        run: |
+          wget -q https://github.com/openstreetmap/osmosis/releases/download/0.49.2/osmosis-0.49.2.zip
+          unzip -q osmosis-0.49.2.zip
+          chmod +x osmosis-0.49.2/bin/osmosis
+          mkdir -p ~/.openstreetmap/osmosis/plugins
+          wget -q -P ~/.openstreetmap/osmosis/plugins https://repo1.maven.org/maven2/org/mapsforge/mapsforge-map-writer/0.21.0/mapsforge-map-writer-0.21.0-jar-with-dependencies.jar
+
+      - name: Crear el mapa para la app
+        if: inputs.que == 'todo'
+        env:
+          JAVA_OPTS: -Xmx6g
+        run: |
+          osmosis-0.49.2/bin/osmosis --rb file=ba.osm.pbf --mw file=buenos-aires.map bbox=-35.10,-58.95,-34.20,-57.80 type=hd zoom-interval-conf=5,0,7,10,8,11,14,12,21 comment="Datos de OpenStreetMap"
+          ls -lh buenos-aires.map
+          test "$(stat -c%s buenos-aires.map)" -gt 10000000
+
+      - name: Publicar el mapa
+        if: inputs.que == 'todo'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mapas
+          files: buenos-aires.map
+
+      - name: Preparar calles, direcciones y lugares
+        if: inputs.que == 'todo'
+        run: |
+          osmium tags-filter ba.osm.pbf w/highway=motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,tertiary,tertiary_link,unclassified,residential,living_street,service,road -o calles.osm.pbf --overwrite
+          osmium cat calles.osm.pbf -o calles.osm --overwrite
+          osmium tags-filter ba.osm.pbf nw/addr:housenumber nw/amenity nw/shop nw/tourism nw/leisure nw/place nw/office nw/historic nw/healthcare nw/railway=station nw/public_transport=station -o lugares.osm.pbf --overwrite
+          osmium export lugares.osm.pbf --geometry-types=point,polygon -f geojsonseq -o lugares.geojsonseq --overwrite
+
+      - name: Crear el archivo de rutas y buscador
+        if: inputs.que == 'todo'
+        run: |
+          python3 proyecto/tools/build_nav.py calles.osm lugares.geojsonseq buenos-aires.nav
+          ls -lh buenos-aires.nav
+          test "$(stat -c%s buenos-aires.nav)" -gt 5000000
+
+      - name: Publicar rutas y buscador
+        if: inputs.que == 'todo'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mapas
+          files: buenos-aires.nav
